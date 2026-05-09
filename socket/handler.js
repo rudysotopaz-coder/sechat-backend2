@@ -55,7 +55,7 @@ module.exports = function (io) {
         );
         if (memberResult.rows.length === 0) return;
 
-        const expires_at = new Date(Date.now() + 60 * 60 * 1000); // +12 hora
+        const expires_at = new Date(Date.now() +2* 60 * 60 * 1000); // +12 hora
         const encrypted_content = (type === 'text' && content) ? encrypt(content) : null;
 
         const msgResult = await pool.query(
