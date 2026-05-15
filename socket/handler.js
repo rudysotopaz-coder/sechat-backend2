@@ -1,12 +1,8 @@
 const { pool } = require('../db');
 const { encrypt, decrypt } = require('../utils/crypto');
 
-// Mapa de socket.id → { session_token, room_id, member_index }
 const socketMeta = new Map();
 
-/**
- * Calcula nombre a mostrar. Ver explicación en messages.js.
- */
 function getDisplayName(senderToken, viewerToken, allMembers) {
   if (senderToken === viewerToken) return 'Yo';
   const others = allMembers
@@ -27,60 +23,71 @@ module.exports = function (io) {
           'SELECT member_index FROM room_members WHERE room_id = $1 AND session_token = $2',
           [room_id, session_token]
         );
-
         if (member.rows.length === 0) {
           socket.emit('error', { message: 'No autorizado para esta sala' });
           return;
         }
-
         socket.join(room_id);
-        socketMeta.set(socket.id, {
-          session_token,
-          room_id,
-          member_index: member.rows[0].member_index
-        });
-
+        socketMeta.set(socket.id, { session_token, room_id, member_index: member.rows[0].member_index });
       } catch (err) {
         console.error('[socket/join_room]', err);
       }
     });
 
     // ── send_message ──────────────────────────────────────────────────────────
-    socket.on('send_message', async ({ room_id, session_token, content, type = 'text', media_url }) => {
+    socket.on('send_message', async ({ room_id, session_token, content, type = 'text', media_url, reply_to_id }) => {
       try {
-        // Verificar membresía
         const memberResult = await pool.query(
           'SELECT member_index FROM room_members WHERE room_id = $1 AND session_token = $2',
           [room_id, session_token]
         );
         if (memberResult.rows.length === 0) return;
 
-        const expires_at = new Date(Date.now() + 72* 60 * 60 * 1000); // +72 hora
+        const expires_at = new Date(Date.now() + 72 * 60 * 60 * 1000); // +72 horas
         const encrypted_content = (type === 'text' && content) ? encrypt(content) : null;
 
         const msgResult = await pool.query(
-          `INSERT INTO messages (room_id, sender_token, content_encrypted, type, media_url, expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO messages (room_id, sender_token, content_encrypted, type, media_url, expires_at, reply_to_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING id, created_at, expires_at`,
-          [room_id, session_token, encrypted_content, type, media_url || null, expires_at]
+          [room_id, session_token, encrypted_content, type, media_url || null, expires_at, reply_to_id || null]
         );
 
         const saved = msgResult.rows[0];
 
-        // Todos los miembros para calcular nombres
+        // Obtener info del mensaje al que se responde
+        let replyToData = null;
+        if (reply_to_id) {
+          const replyMsg = await pool.query(
+            'SELECT id, content_encrypted, type, sender_token FROM messages WHERE id = $1',
+            [reply_to_id]
+          );
+          if (replyMsg.rows.length > 0) {
+            replyToData = replyMsg.rows[0];
+          }
+        }
+
         const allMembers = await pool.query(
           'SELECT session_token, member_index FROM room_members WHERE room_id = $1 ORDER BY member_index',
           [room_id]
         );
 
-        // Enviar mensaje personalizado a cada socket conectado en la sala
         const socketsInRoom = await io.in(room_id).fetchSockets();
 
         for (const s of socketsInRoom) {
           const meta = socketMeta.get(s.id);
           if (!meta) continue;
-
           const viewerToken = meta.session_token;
+
+          let reply_to = null;
+          if (replyToData) {
+            reply_to = {
+              id: replyToData.id,
+              type: replyToData.type,
+              content: replyToData.content_encrypted ? decrypt(replyToData.content_encrypted) : null,
+              sender: getDisplayName(replyToData.sender_token, viewerToken, allMembers.rows)
+            };
+          }
 
           s.emit('new_message', {
             id: saved.id,
@@ -90,16 +97,54 @@ module.exports = function (io) {
             content: type === 'text' ? content : null,
             media_url: media_url || null,
             expires_at: saved.expires_at,
-            created_at: saved.created_at
+            created_at: saved.created_at,
+            reactions: {},
+            reply_to
           });
         }
-
       } catch (err) {
         console.error('[socket/send_message]', err);
       }
     });
 
-    // ── room_deleted — notifica a los miembros que la sala fue eliminada ──────
+    // ── add_reaction ──────────────────────────────────────────────────────────
+    socket.on('add_reaction', async ({ room_id, session_token, message_id, emoji }) => {
+      try {
+        // Verificar membresía
+        const member = await pool.query(
+          'SELECT id FROM room_members WHERE room_id = $1 AND session_token = $2',
+          [room_id, session_token]
+        );
+        if (member.rows.length === 0) return;
+
+        const msg = await pool.query('SELECT reactions FROM messages WHERE id = $1', [message_id]);
+        if (!msg.rows.length) return;
+
+        const reactions = msg.rows[0].reactions || {};
+        const tokens = reactions[emoji] ? [...reactions[emoji]] : [];
+
+        const idx = tokens.indexOf(session_token);
+        if (idx >= 0) {
+          tokens.splice(idx, 1); // toggle off
+        } else {
+          tokens.push(session_token); // toggle on
+        }
+
+        if (tokens.length === 0) {
+          delete reactions[emoji];
+        } else {
+          reactions[emoji] = tokens;
+        }
+
+        await pool.query('UPDATE messages SET reactions = $1 WHERE id = $2', [JSON.stringify(reactions), message_id]);
+
+        io.to(room_id).emit('reaction_updated', { message_id, reactions });
+      } catch (err) {
+        console.error('[socket/add_reaction]', err);
+      }
+    });
+
+    // ── room_deleted ──────────────────────────────────────────────────────────
     socket.on('notify_room_deleted', ({ room_id }) => {
       socket.to(room_id).emit('room_closed');
     });
