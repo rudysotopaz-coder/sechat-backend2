@@ -48,7 +48,7 @@ router.get('/:room_id', async (req, res) => {
     const messages = await pool.query(
       `SELECT id, sender_token, content_encrypted, type, media_url, expires_at, created_at, reactions, reply_to_id
        FROM messages
-       WHERE room_id = $1 AND expires_at > NOW()
+      WHERE room_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY created_at ASC`,
       [room_id]
     );
