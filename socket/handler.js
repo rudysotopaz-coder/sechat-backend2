@@ -188,7 +188,6 @@ module.exports = function (io) {
         );
 
         if (msg.rows.length > 0) {
-          // 15 segundos para leer antes de borrar
           setTimeout(async () => {
             try {
               await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
