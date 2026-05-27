@@ -188,8 +188,13 @@ module.exports = function (io) {
         );
 
         if (msg.rows.length > 0) {
-          await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
-          io.to(room_id).emit('message_deleted', { message_id });
+          // 15 segundos para leer antes de borrar
+          setTimeout(async () => {
+            try {
+              await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
+              io.to(room_id).emit('message_deleted', { message_id });
+            } catch {}
+          }, 15000);
         }
       } catch (err) {
         console.error('[socket/message_read]', err);
