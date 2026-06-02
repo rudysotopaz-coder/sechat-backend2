@@ -3,7 +3,6 @@ const router = express.Router();
 const multer = require('multer');
 const { v2: cloudinary } = require('cloudinary');
 const { pool } = require('../db');
-const { decrypt } = require('../utils/crypto');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -45,18 +44,16 @@ router.get('/:room_id', async (req, res) => {
       [room_id]
     );
 
+    // Incluir mensajes efímeros (expires_at IS NULL = read_once)
     const messages = await pool.query(
       `SELECT id, sender_token, content_encrypted, type, media_url, expires_at, created_at, reactions, reply_to_id
        FROM messages
-      WHERE room_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
+       WHERE room_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY created_at ASC`,
       [room_id]
     );
 
-    const replyIds = messages.rows
-      .filter(m => m.reply_to_id)
-      .map(m => m.reply_to_id);
-
+    const replyIds = messages.rows.filter(m => m.reply_to_id).map(m => m.reply_to_id);
     let replyMap = {};
     if (replyIds.length > 0) {
       const replies = await pool.query(
@@ -66,6 +63,10 @@ router.get('/:room_id', async (req, res) => {
       replies.rows.forEach(r => { replyMap[r.id] = r; });
     }
 
+    // Obtener duración de la sala para identificar read_once
+    const roomData = await pool.query('SELECT message_duration FROM rooms WHERE id = $1', [room_id]);
+    const roomDuration = roomData.rows[0]?.message_duration ?? 48;
+
     const result = messages.rows.map(msg => {
       let reply_to = null;
       if (msg.reply_to_id && replyMap[msg.reply_to_id]) {
@@ -73,7 +74,8 @@ router.get('/:room_id', async (req, res) => {
         reply_to = {
           id: rm.id,
           type: rm.type,
-          content: rm.content_encrypted ? decrypt(rm.content_encrypted) : null,
+          // Pasar contenido cifrado — cliente descifra
+          content: rm.content_encrypted,
           sender: getDisplayName(rm.sender_token, session_token, allMembers.rows)
         };
       }
@@ -83,12 +85,14 @@ router.get('/:room_id', async (req, res) => {
         sender: getDisplayName(msg.sender_token, session_token, allMembers.rows),
         isMe: msg.sender_token === session_token,
         type: msg.type,
-        content: msg.content_encrypted ? decrypt(msg.content_encrypted) : null,
+        // Pasar contenido cifrado tal como está — cliente descifra E2E
+        content: msg.content_encrypted,
         media_url: msg.media_url || null,
         expires_at: msg.expires_at,
         created_at: msg.created_at,
         reactions: msg.reactions || {},
-        reply_to
+        reply_to,
+        read_once: msg.expires_at === null && roomDuration === 0
       };
     });
 
@@ -99,7 +103,7 @@ router.get('/:room_id', async (req, res) => {
   }
 });
 
-// ── POST /api/messages/upload ─────────────────────────────────────────────────
+// ── POST /api/messages/upload (Cloudinary — imágenes grandes) ─────────────────
 router.post('/upload', upload.single('file'), async (req, res) => {
   const { session_token, room_id } = req.body;
 

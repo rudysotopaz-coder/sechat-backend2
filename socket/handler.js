@@ -1,5 +1,4 @@
 const { pool } = require('../db');
-const { encrypt, decrypt } = require('../utils/crypto');
 
 const socketMeta = new Map();
 const rateLimitMap = new Map();
@@ -36,7 +35,7 @@ function getDisplayName(senderToken, viewerToken, allMembers) {
 }
 
 function calcExpiresAt(durationHours) {
-  if (durationHours === 0) return null; // se borra al leer
+  if (durationHours === 0) return null;
   const hours = [1, 6, 12, 24, 48].includes(durationHours) ? durationHours : 48;
   return new Date(Date.now() + hours * 60 * 60 * 1000);
 }
@@ -59,16 +58,6 @@ module.exports = function (io) {
           session_token, room_id,
           member_index: member.rows[0].member_index
         });
-
-        // Analítica
-        try {
-          const now = new Date();
-          await pool.query(
-            'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week) VALUES ($1, $2, $3)',
-            ['message_sent', now.getHours(), now.getDay()]
-          );
-        } catch {}
-
       } catch (err) {
         console.error('[socket/join_room]', err);
       }
@@ -87,7 +76,6 @@ module.exports = function (io) {
         );
         if (memberResult.rows.length === 0) return;
 
-        // Obtener duración de la sala
         const roomResult = await pool.query(
           'SELECT message_duration FROM rooms WHERE id = $1',
           [room_id]
@@ -95,13 +83,16 @@ module.exports = function (io) {
         const duration = roomResult.rows[0]?.message_duration ?? 48;
         const expires_at = calcExpiresAt(duration);
 
-        const encrypted_content = (type === 'text' && content) ? encrypt(content) : null;
+        // Servidor almacena el contenido tal como viene (E2E cifrado o legacy)
+        // Para text/image_e2e: content tiene el payload cifrado
+        // Para image (Cloudinary): media_url tiene la URL
+        const storedContent = content || null;
 
         const msgResult = await pool.query(
           `INSERT INTO messages (room_id, sender_token, content_encrypted, type, media_url, expires_at, reply_to_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING id, created_at, expires_at`,
-          [room_id, session_token, encrypted_content, type, media_url || null, expires_at, reply_to_id || null]
+          [room_id, session_token, storedContent, type, media_url || null, expires_at, reply_to_id || null]
         );
 
         const saved = msgResult.rows[0];
@@ -132,12 +123,12 @@ module.exports = function (io) {
             reply_to = {
               id: replyToData.id,
               type: replyToData.type,
-              content: replyToData.content_encrypted ? decrypt(replyToData.content_encrypted) : null,
+              // Pasar el contenido cifrado tal como está — el cliente lo descifra
+              content: replyToData.content_encrypted,
               sender: getDisplayName(replyToData.sender_token, viewerToken, allMembers.rows)
             };
           }
 
-          // Si duración es 0 (al leer), marcar para el receptor
           const isReadOnce = duration === 0;
 
           s.emit('new_message', {
@@ -145,7 +136,8 @@ module.exports = function (io) {
             sender: getDisplayName(session_token, viewerToken, allMembers.rows),
             isMe: viewerToken === session_token,
             type,
-            content: type === 'text' ? content : null,
+            // Pasar contenido cifrado tal como está — cliente descifra
+            content: storedContent,
             media_url: media_url || null,
             expires_at: saved.expires_at,
             created_at: saved.created_at,
@@ -155,7 +147,7 @@ module.exports = function (io) {
           });
         }
 
-        // Analítica
+        // Analítica anónima
         try {
           const now = new Date();
           await pool.query(
@@ -169,7 +161,6 @@ module.exports = function (io) {
       }
     });
 
-    // Marcar mensaje como leído (para read_once)
     socket.on('message_read', async ({ message_id, room_id, session_token }) => {
       try {
         const member = await pool.query(
@@ -178,7 +169,6 @@ module.exports = function (io) {
         );
         if (member.rows.length === 0) return;
 
-        // Verificar si el mensaje es read_once
         const msg = await pool.query(
           `SELECT m.id FROM messages m
            JOIN rooms r ON r.id = m.room_id
@@ -219,10 +209,7 @@ module.exports = function (io) {
         if (tokens.length === 0) delete reactions[emoji];
         else reactions[emoji] = tokens;
 
-        await pool.query(
-          'UPDATE messages SET reactions = $1 WHERE id = $2',
-          [JSON.stringify(reactions), message_id]
-        );
+        await pool.query('UPDATE messages SET reactions = $1 WHERE id = $2', [JSON.stringify(reactions), message_id]);
         io.to(room_id).emit('reaction_updated', { message_id, reactions });
       } catch (err) {
         console.error('[socket/add_reaction]', err);
