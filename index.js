@@ -20,10 +20,12 @@ const io = new Server(server, {
   maxHttpBufferSize: 15e6
 });
 
+// Exponer io para rutas
+app.set('io', io);
+
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-// Rate limiting básico por IP para rutas de API
 const ipRequestMap = new Map();
 function apiRateLimit(req, res, next) {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -33,16 +35,13 @@ function apiRateLimit(req, res, next) {
     ipRequestMap.set(ip, { count: 1, resetAt: now + 60000 });
     return next();
   }
-  if (entry.count >= 60) {
-    return res.status(429).json({ error: 'Demasiadas solicitudes. Espera un momento.' });
-  }
+  if (entry.count >= 60) return res.status(429).json({ error: 'Demasiadas solicitudes.' });
   entry.count++;
   next();
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
 
-// Version endpoint para actualizaciones in-app
 app.get('/api/version', (req, res) => {
   res.json({
     android: process.env.APP_VERSION_ANDROID || '1.0.0',
@@ -58,24 +57,14 @@ app.use('/api/analytics', analyticsRouter);
 
 socketHandler(io);
 
-// Limpieza de mensajes expirados cada 5 minutos
 cron.schedule('*/5 * * * *', async () => {
-  try { await cleanupExpiredMessages(); } catch (err) {
-    console.error('[Cron] Error en limpieza mensajes:', err.message);
-  }
+  try { await cleanupExpiredMessages(); } catch {}
 });
 
-// Limpieza de salas inactivas cada día a medianoche
 cron.schedule('0 0 * * *', async () => {
-  try {
-    const count = await cleanupInactiveRooms();
-    if (count > 0) console.log(`[Cron] ${count} salas inactivas eliminadas`);
-  } catch (err) {
-    console.error('[Cron] Error en limpieza salas:', err.message);
-  }
+  try { await cleanupInactiveRooms(); } catch {}
 });
 
-// Limpiar rate limit map cada 10 minutos
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of ipRequestMap.entries()) {
@@ -85,13 +74,11 @@ setInterval(() => {
 
 const PORT = process.env.PORT || 3000;
 
-initDB()
-  .then(() => {
-    server.listen(PORT, () => {
-      console.log(`[Huum] Backend activo en puerto ${PORT}`);
-    });
-  })
-  .catch(err => {
-    console.error('[Huum] Error iniciando DB:', err);
-    process.exit(1);
+initDB().then(() => {
+  server.listen(PORT, () => {
+    console.log(`[Huum] Backend activo en puerto ${PORT}`);
   });
+}).catch(err => {
+  console.error('[Huum] Error iniciando DB:', err);
+  process.exit(1);
+});

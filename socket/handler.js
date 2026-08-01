@@ -1,6 +1,6 @@
 const { pool } = require('../db');
 
-const socketMeta = new Map();
+const socketMeta = new Map(); // socket.id -> { session_token, room_id, connected_at, device_type }
 const rateLimitMap = new Map();
 const RATE_LIMIT_MAX = 30;
 const RATE_LIMIT_WINDOW = 60 * 1000;
@@ -24,6 +24,15 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+function getDeviceType(userAgent) {
+  if (!userAgent) return 'unknown';
+  const ua = userAgent.toLowerCase();
+  if (ua.includes('iphone') || ua.includes('android') && ua.includes('mobile')) return 'mobile';
+  if (ua.includes('ipad') || ua.includes('tablet')) return 'tablet';
+  if (ua.includes('android')) return 'android';
+  return 'desktop';
+}
+
 function getDisplayName(senderToken, viewerToken, allMembers) {
   if (senderToken === viewerToken) return 'Yo';
   const others = allMembers
@@ -42,6 +51,16 @@ function calcExpiresAt(durationHours) {
 
 module.exports = function (io) {
   io.on('connection', (socket) => {
+    const userAgent = socket.handshake.headers['user-agent'] || '';
+    const deviceType = getDeviceType(userAgent);
+    const connectedAt = Date.now();
+
+    // Registrar conexión en analytics
+    const now = new Date();
+    pool.query(
+      'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week, device_type) VALUES ($1, $2, $3, $4)',
+      ['socket_connect', now.getHours(), now.getDay(), deviceType]
+    ).catch(() => {});
 
     socket.on('join_room', async ({ room_id, session_token }) => {
       try {
@@ -56,8 +75,18 @@ module.exports = function (io) {
         socket.join(room_id);
         socketMeta.set(socket.id, {
           session_token, room_id,
-          member_index: member.rows[0].member_index
+          member_index: member.rows[0].member_index,
+          connected_at: connectedAt,
+          device_type: deviceType
         });
+
+        // Analítica
+        const n = new Date();
+        pool.query(
+          'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week, device_type) VALUES ($1, $2, $3, $4)',
+          ['room_join', n.getHours(), n.getDay(), deviceType]
+        ).catch(() => {});
+
       } catch (err) {
         console.error('[socket/join_room]', err);
       }
@@ -76,16 +105,9 @@ module.exports = function (io) {
         );
         if (memberResult.rows.length === 0) return;
 
-        const roomResult = await pool.query(
-          'SELECT message_duration FROM rooms WHERE id = $1',
-          [room_id]
-        );
+        const roomResult = await pool.query('SELECT message_duration FROM rooms WHERE id = $1', [room_id]);
         const duration = roomResult.rows[0]?.message_duration ?? 48;
         const expires_at = calcExpiresAt(duration);
-
-        // Servidor almacena el contenido tal como viene (E2E cifrado o legacy)
-        // Para text/image_e2e: content tiene el payload cifrado
-        // Para image (Cloudinary): media_url tiene la URL
         const storedContent = content || null;
 
         const msgResult = await pool.query(
@@ -112,7 +134,6 @@ module.exports = function (io) {
         );
 
         const socketsInRoom = await io.in(room_id).fetchSockets();
-
         for (const s of socketsInRoom) {
           const meta = socketMeta.get(s.id);
           if (!meta) continue;
@@ -123,38 +144,32 @@ module.exports = function (io) {
             reply_to = {
               id: replyToData.id,
               type: replyToData.type,
-              // Pasar el contenido cifrado tal como está — el cliente lo descifra
               content: replyToData.content_encrypted,
               sender: getDisplayName(replyToData.sender_token, viewerToken, allMembers.rows)
             };
           }
-
-          const isReadOnce = duration === 0;
 
           s.emit('new_message', {
             id: saved.id,
             sender: getDisplayName(session_token, viewerToken, allMembers.rows),
             isMe: viewerToken === session_token,
             type,
-            // Pasar contenido cifrado tal como está — cliente descifra
             content: storedContent,
             media_url: media_url || null,
             expires_at: saved.expires_at,
             created_at: saved.created_at,
             reactions: {},
             reply_to,
-            read_once: isReadOnce
+            read_once: duration === 0
           });
         }
 
-        // Analítica anónima
-        try {
-          const now = new Date();
-          await pool.query(
-            'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week) VALUES ($1, $2, $3)',
-            ['message_sent', now.getHours(), now.getDay()]
-          );
-        } catch {}
+        // Analítica
+        const n = new Date();
+        pool.query(
+          'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week, device_type) VALUES ($1, $2, $3, $4)',
+          ['message_sent', n.getHours(), n.getDay(), deviceType]
+        ).catch(() => {});
 
       } catch (err) {
         console.error('[socket/send_message]', err);
@@ -172,8 +187,7 @@ module.exports = function (io) {
         const msg = await pool.query(
           `SELECT m.id FROM messages m
            JOIN rooms r ON r.id = m.room_id
-           WHERE m.id = $1 AND r.message_duration = 0
-           AND m.sender_token != $2`,
+           WHERE m.id = $1 AND r.message_duration = 0 AND m.sender_token != $2`,
           [message_id, session_token]
         );
 
@@ -216,6 +230,20 @@ module.exports = function (io) {
       }
     });
 
+    // Endpoint para superusuario — borrar mensaje
+    socket.on('admin_delete_message', async ({ message_id, admin_token }) => {
+      try {
+        if (admin_token !== process.env.ADMIN_TOKEN) return;
+        const msg = await pool.query('SELECT room_id FROM messages WHERE id = $1', [message_id]);
+        if (!msg.rows.length) return;
+        const room_id = msg.rows[0].room_id;
+        await pool.query('DELETE FROM messages WHERE id = $1', [message_id]);
+        io.to(room_id).emit('message_deleted', { message_id });
+      } catch (err) {
+        console.error('[socket/admin_delete_message]', err);
+      }
+    });
+
     socket.on('notify_room_deleted', ({ room_id }) => {
       socket.to(room_id).emit('room_closed');
     });
@@ -226,7 +254,18 @@ module.exports = function (io) {
     });
 
     socket.on('disconnect', () => {
+      const meta = socketMeta.get(socket.id);
+      if (meta) {
+        const duration = Math.floor((Date.now() - meta.connected_at) / 1000);
+        pool.query(
+          'INSERT INTO analytics_events (event_type, hour_of_day, day_of_week, device_type, duration_seconds) VALUES ($1, $2, $3, $4, $5)',
+          ['socket_disconnect', new Date().getHours(), new Date().getDay(), meta.device_type, duration]
+        ).catch(() => {});
+      }
       socketMeta.delete(socket.id);
     });
   });
+
+  // Exponer socketMeta para el endpoint de analytics live
+  io.socketMeta = socketMeta;
 };
